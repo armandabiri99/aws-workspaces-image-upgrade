@@ -79,6 +79,31 @@ Monitor progress in **Step Functions → Executions** and **CloudWatch Logs**.
 
 ---
 
+## 💰 Cost and Lifecycle Management
+
+The stack is designed to be cost-efficient when idle.
+
+### 🔹 When `AutoSelfDeleteStack = true`
+- The stack automatically deletes itself after writing the report.  
+- All related resources (Lambdas, Step Functions, DLQ, roles, etc.) are removed.  
+- Ideal for one-shot upgrades where you don’t plan to reuse the stack soon.  
+- **No ongoing cost** after deletion.
+
+### 🔹 When `AutoSelfDeleteStack = false`
+- The stack stays deployed for future reuse (simply update parameters for next image upgrades).
+- All Lambdas, Step Functions, and SQS remain **idle** and cost **$0** when not invoked.
+- **Only small ongoing cost** (~$1 per AWS KMS key per month) applies **if the template created new KMS CMKs** for SQS or CloudWatch Logs.
+- If you **provide your own KMS ARNs**, or accept minimal key cost, you can safely keep the stack around.
+- Recommended if you plan to re-run upgrades every few months.
+
+### ⚖️ Summary
+| Setting | Behavior | Typical Cost per Month | Recommended When |
+|----------|-----------|------------------------|------------------|
+| `AutoSelfDeleteStack=true` | Deletes after run | $0 | One-time upgrades |
+| `AutoSelfDeleteStack=false` | Keeps stack reusable | ~$0–$2 (if new CMKs) | Periodic reuse |
+
+---
+
 ## 📊 Output
 
 After completion:
@@ -93,15 +118,6 @@ After completion:
   ```
 
 If `AutoSelfDeleteStack=true`, the stack self-deletes after report upload.
-
----
-
-## 💡 Tips & Cost Optimization
-
-- Increase `PollSeconds` (e.g., 300) to reduce Step Function/Lambda cost.
-- Set `AutoSelfDeleteStack=false` if you want to reuse the stack.
-- Keep NAT or VPC endpoints active only during the upgrade.
-- Use **Reserved Concurrency** to control Lambda cost.
 
 ---
 
