@@ -1,0 +1,957 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-shot, snapshot-chasing Amazon WorkSpaces image upgrade.
+  Steps:
+  1) Update the target custom Bundle to a new ImageId
+  2) Wait for the next rebuild snapshot per WorkSpace
+  3) (Optional) notify users via SSM
+  4) Rebuild WorkSpaces
+  5) Write CSV report to S3 (optionally with SSE-KMS)
+  6) (Optional) self-delete the stack (AutoSelfDeleteStack)
+  NOTE: For re-use across upgrades, set AutoSelfDeleteStack="false" and update stack with new parameters.
+
+Parameters:
+  TargetTagKey:
+    Type: String
+    Description: Tag key to select WorkSpaces (e.g., Env)
+  TargetTagValue:
+    Type: String
+    Description: Tag value to select WorkSpaces (e.g., Prod)
+  BundleId:
+    Type: String
+    Description: Target custom WorkSpaces BundleId (wsb-xxxxxxxxx)
+  ImageId:
+    Type: String
+    Description: New custom ImageId (wsi-xxxxxxxxx) to assign to the Bundle
+  NotifySeconds:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 600
+    Description: Seconds to warn users (0 = disabled)
+  PollSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 600
+    Description: Poll interval (seconds) while waiting for next snapshot
+  WaitTimeoutMinutes:
+    Type: Number
+    Default: 720
+    MinValue: 10
+    MaxValue: 2880
+    Description: Max minutes to wait for the next snapshot per WorkSpace
+  MaxConcurrent:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: Max WorkSpaces processed in parallel
+  ReportBucketName:
+    Type: String
+    Description: Existing S3 bucket name (no s3://) for the CSV report
+  ReportPrefix:
+    Type: String
+    Default: workspaces-upgrades/
+    Description: Optional S3 key prefix (e.g., workspaces-upgrades/)
+  ReportSSEKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: (Optional) KMS key ARN for SSE-KMS on report objects.
+  AutoSelfDeleteStack:
+    Type: String
+    AllowedValues: ["true","false"]
+    Default: "true"
+    Description: If "true", delete this stack after writing the report
+
+  # Networking / Compliance
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for Lambdas (must have NAT egress or VPC endpoints)
+  LambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group for Lambdas (allow egress to AWS APIs via NAT or endpoints)
+  SigningProfileVersionArn:
+    Type: String
+    Description: AWS Signer signing profile version ARN for Lambda code signing (Warn mode)
+
+  # DLQ encryption
+  SqsKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: "(Optional) Customer KMS key ARN for SQS DLQ encryption. Leave blank to create a CMK."
+
+  # CloudWatch Logs encryption (all log groups)
+  LogsKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: "(Optional) Customer KMS key ARN for CloudWatch Logs encryption. Leave blank to create a CMK."
+
+  # Reserved concurrency caps
+  RCUpdateBundle:
+    Type: Number
+    Default: 2
+  RCListTargets:
+    Type: Number
+    Default: 5
+  RCProcessWorkspace:
+    Type: Number
+    Default: 20
+  RCReportCleanup:
+    Type: Number
+    Default: 2
+  RCKickoff:
+    Type: Number
+    Default: 1
+
+Conditions:
+  UseProvidedSqsKms: !Not [ !Equals [ !Ref SqsKmsKeyArn, "" ] ]
+  CreateSqsKmsKey: !Equals [ !Ref SqsKmsKeyArn, "" ]
+  UseProvidedLogsKms: !Not [ !Equals [ !Ref LogsKmsKeyArn, "" ] ]
+  CreateLogsKmsKey: !Equals [ !Ref LogsKmsKeyArn, "" ]
+  UseReportSSEKms: !Not [ !Equals [ !Ref ReportSSEKmsKeyArn, "" ] ]
+
+Resources:
+  ########################################################
+  # KMS for SQS DLQ (created only if not provided)
+  ########################################################
+  SqsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateSqsKmsKey
+    Properties:
+      Description: !Sub "CMK for SQS DLQ encryption - ${AWS::StackName}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowSQSUseOfKey
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !GetAtt LambdaDLQ.Arn
+
+  SqsKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateSqsKmsKey
+    Properties:
+      AliasName: !Sub alias/ws-upgrade-sqs-${AWS::StackName}
+      TargetKeyId: !Ref SqsKmsKey
+
+  ########################################################
+  # KMS for CloudWatch Logs (created only if not provided)
+  ########################################################
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateLogsKmsKey
+    Properties:
+      Description: !Sub "CMK for CloudWatch Logs encryption - ${AWS::StackName}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogsUseOfKey
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+
+  LogsKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateLogsKmsKey
+    Properties:
+      AliasName: !Sub alias/ws-upgrade-logs-${AWS::StackName}
+      TargetKeyId: !Ref LogsKmsKey
+
+  ########################################################
+  # Shared DLQ + Code Signing Config
+  ########################################################
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: !If
+        - UseProvidedSqsKms
+        - !Ref SqsKmsKeyArn
+        - !GetAtt SqsKmsKey.Arn
+
+  LambdaCodeSigningConfig:
+    Type: AWS::Lambda::CodeSigningConfig
+    Properties:
+      AllowedPublishers:
+        SigningProfileVersionArns:
+          - !Ref SigningProfileVersionArn
+      CodeSigningPolicies:
+        UntrustedArtifactOnDeployment: Warn
+
+  ########################################################
+  # Managed Policies (no inline policies)
+  ########################################################
+  MPWorkSpacesOps:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - workspaces:DescribeWorkspaces
+              - workspaces:DescribeWorkspaceSnapshots
+              - workspaces:RebuildWorkspaces
+              - workspaces:ListTagsForResource
+              - workspaces:UpdateWorkspaceBundle
+            Resource: "*"
+
+  MPSSMOps:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:SendCommand
+              - ssm:ListCommands
+              - ssm:ListCommandInvocations
+              - ssm:DescribeInstanceInformation
+            Resource: "*"
+
+  MPS3ReportWrite:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+            Resource: !Sub arn:${AWS::Partition}:s3:::${ReportBucketName}/*
+
+  MPCFNDeleteSelf:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: cloudformation:DeleteStack
+            Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+
+  MPStartExecution:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref UpgradeStateMachine
+
+  MPSFNInvokeLambda:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InvokeOnlyThese
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt UpdateBundleFn.Arn
+              - !GetAtt ListTargetsFn.Arn
+              - !GetAtt ProcessWorkspaceFn.Arn
+              - !GetAtt ReportAndCleanupFn.Arn
+
+  MPStateLogs:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutLogEvents
+              - logs:CreateLogStream
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:PutResourcePolicy
+            Resource: "*"
+
+  MPLambdaDlqSend:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDLQ.Arn
+
+  ########################################################
+  # Roles
+  ########################################################
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref MPWorkSpacesOps
+        - !Ref MPSSMOps
+        - !Ref MPS3ReportWrite
+        - !Ref MPCFNDeleteSelf
+        - !Ref MPLambdaDlqSend
+
+  SFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref MPSFNInvokeLambda
+        - !Ref MPStateLogs
+
+  KickoffRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref MPStartExecution
+        - !Ref MPLambdaDlqSend
+
+  ########################################################
+  # CloudWatch Log Groups (retention + KMS encryption)
+  ########################################################
+  LogUpdate:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-UpdateBundleFn"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  LogList:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ListTargetsFn"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  LogProc:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ProcessWorkspaceFn"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  LogRpt:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ReportAndCleanupFn"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  LogKick:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-KickoffFn"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  ########################################################
+  # Lambda Functions (VPC, DLQ, Code Signing, Reserved Concurrency)
+  ########################################################
+  UpdateBundleFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-UpdateBundleFn"
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref RCUpdateBundle
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      DeadLetterConfig: { TargetArn: !GetAtt LambdaDLQ.Arn }
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+        SubnetIds: !Ref SubnetIds
+      Code:
+        ZipFile: |
+          import boto3
+          ws = boto3.client('workspaces')
+          def handler(event, context):
+              ws.update_workspace_bundle(BundleId=event['BundleId'], ImageId=event['ImageId'])
+              return {"ok": True, "updated": True}
+
+  ListTargetsFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ListTargetsFn"
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref RCListTargets
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      DeadLetterConfig: { TargetArn: !GetAtt LambdaDLQ.Arn }
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+        SubnetIds: !Ref SubnetIds
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          from botocore.exceptions import ClientError
+          ws = boto3.client('workspaces')
+
+          def list_tags(workspace_id):
+              for attempt in range(5):
+                  try:
+                      return ws.list_tags_for_resource(ResourceId=workspace_id).get('TagList', [])
+                  except ClientError as e:
+                      if e.response['Error']['Code'] in ('ThrottlingException','TooManyRequestsException'):
+                          time.sleep(2 ** attempt)
+                          continue
+                      raise
+              return []
+
+          def handler(event, context):
+              key, val = event['TagKey'], event['TagValue']
+              out, nt = [], None
+              while True:
+                  args = {}
+                  if nt: args['NextToken'] = nt
+                  r = ws.describe_workspaces(**args)
+                  for w in r.get('Workspaces', []):
+                      wid = w['WorkspaceId']
+                      try:
+                          tags = list_tags(wid)
+                          if any(t['Key']==key and t['Value']==val for t in tags):
+                              out.append({
+                                  "WorkspaceId": wid,
+                                  "ComputerName": w.get("ComputerName","")
+                              })
+                      except Exception:
+                          pass
+                  nt = r.get('NextToken')
+                  if not nt:
+                      break
+              return {"Targets": out}
+
+  ProcessWorkspaceFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ProcessWorkspaceFn"
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 512
+      ReservedConcurrentExecutions: !Ref RCProcessWorkspace
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      DeadLetterConfig: { TargetArn: !GetAtt LambdaDLQ.Arn }
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+        SubnetIds: !Ref SubnetIds
+      Code:
+        ZipFile: |
+          import boto3, time, datetime
+          ws  = boto3.client('workspaces')
+          ssm = boto3.client('ssm')
+
+          def latest_snapshot_info(wid):
+              r = ws.describe_workspace_snapshots(WorkspaceId=wid)
+              snaps = r.get('RebuildSnapshots', [])
+              if not snaps:
+                  return {"iso": "", "ts": 0.0}
+              latest = max(snaps, key=lambda s: s['SnapshotTime'])
+              st = latest['SnapshotTime']
+              ts = st.timestamp()
+              iso = st.strftime('%Y-%m-%dT%H:%M:%SZ')
+              return {"iso": iso, "ts": ts}
+
+          def is_fresh_since(wid, base_ts):
+              cur = latest_snapshot_info(wid)
+              if base_ts <= 0.0:
+                  return (False, cur)
+              return (cur["ts"] > base_ts, cur)
+
+          def _find_ssm_instance_id(computer_name):
+              if not computer_name:
+                  return None
+              paginator = ssm.get_paginator('describe_instance_information')
+              for page in paginator.paginate():
+                  for mi in page.get('InstanceInformationList', []):
+                      if mi.get('ComputerName','').lower() == computer_name.lower():
+                          return mi['InstanceId']
+              return None
+
+          def best_effort_notify(computer_name, sec):
+              if sec <= 0:
+                  return {"sent": False, "note": "notify disabled"}
+              iid = _find_ssm_instance_id(computer_name)
+              if not iid:
+                  return {"sent": False, "note": "SSM instance not found"}
+              try:
+                  cmds = ['cmd /c msg * "ATTENTION: Your WorkSpace will be rebuilt from the latest snapshot. Please SAVE your work now."']
+                  ssm.send_command(
+                      DocumentName="AWS-RunPowerShellScript",
+                      Parameters={"commands": cmds},
+                      InstanceIds=[iid],
+                      TimeoutSeconds=900
+                  )
+                  return {"sent": True}
+              except Exception as e:
+                  return {"sent": False, "note": str(e)}
+
+          def _deadline_epoch(wait_minutes):
+              return int(time.time()) + int(wait_minutes) * 60
+
+          def handler(event, ctx):
+              action = event['Action']
+              wid = event['WorkspaceId']
+
+              if action == 'ComputeDeadline':
+                  return {"WorkspaceId": wid, "DeadlineEpoch": _deadline_epoch(event['WaitTimeoutMinutes'])}
+
+              if action == 'GetBaseline':
+                  info = latest_snapshot_info(wid)
+                  out = {"WorkspaceId": wid, "BaselineIso": info["iso"], "BaselineTs": info["ts"]}
+                  if 'WaitTimeoutMinutes' in event:
+                      out["DeadlineEpoch"] = _deadline_epoch(event['WaitTimeoutMinutes'])
+                  return out
+
+              if action == 'WaitNext':
+                  base_iso = event.get('BaselineIso', "")
+                  base_ts = float(event.get('BaselineTs', 0.0)) if 'BaselineTs' in event else 0.0
+                  dl = int(event['DeadlineEpoch'])
+                  if int(time.time()) >= dl:
+                      cur = latest_snapshot_info(wid)
+                      return {"WorkspaceId": wid, "fresh": False, "timedOut": True, "latestIso": cur["iso"], "latestTs": cur["ts"], "BaselineIso": base_iso, "BaselineTs": base_ts}
+                  fresh, cur = is_fresh_since(wid, base_ts)
+                  return {"WorkspaceId": wid, "fresh": fresh, "timedOut": False, "latestIso": cur["iso"], "latestTs": cur["ts"], "BaselineIso": base_iso, "BaselineTs": base_ts}
+
+              if action == 'Notify':
+                  sec = int(event['NotifySeconds'])
+                  cn  = event.get('ComputerName', '')
+                  r = best_effort_notify(cn, sec)
+                  r.update({"WorkspaceId": wid})
+                  return r
+
+              if action == 'Rebuild':
+                  ws.rebuild_workspaces(RebuildWorkspaceRequests=[{"WorkspaceId": wid}])
+                  return {"WorkspaceId": wid, "RebuildRequested": True, "RebuildRequestedAt": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+
+              return {"error": "unknown action"}
+
+  ReportAndCleanupFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ReportAndCleanupFn"
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref RCReportCleanup
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      DeadLetterConfig: { TargetArn: !GetAtt LambdaDLQ.Arn }
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          AUTO_DELETE: !Ref AutoSelfDeleteStack
+      Code:
+        ZipFile: |
+          import os, boto3, csv, io, datetime
+          s3  = boto3.client('s3')
+          cfn = boto3.client('cloudformation')
+
+          def _s(v): return "" if v is None else str(v)
+
+          def handler(event, ctx):
+              results = event.get('Results', [])
+              bucket  = event['ReportBucketName']
+              prefix  = (event.get('ReportPrefix') or '').lstrip('/')
+              if prefix and not prefix.endswith('/'):
+                  prefix += '/'
+              ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+              key = f"{prefix}workspaces-upgrade-report-{ts}.csv"
+
+              headers = [
+                "WorkspaceId","ComputerName","BaselineSnapshotIso","FreshSnapshotIso",
+                "NotifySeconds","UserNotified","RebuildRequested","RebuildRequestedAt","TimedOutWaiting"
+              ]
+              buf = io.StringIO()
+              w = csv.DictWriter(buf, fieldnames=headers)
+              w.writeheader()
+              for r in results:
+                row = {k: _s(r.get(k, "")) for k in headers}
+                w.writerow(row)
+
+              put_args = {"Bucket": bucket, "Key": key, "Body": buf.getvalue().encode('utf-8'), "ContentType": 'text/csv'}
+              if event.get('ReportSSEKmsKeyArn'):
+                  put_args["ServerSideEncryption"] = 'aws:kms'
+                  put_args["SSEKMSKeyId"] = event['ReportSSEKmsKeyArn']
+              s3.put_object(**put_args)
+
+              out = {"ReportObjectKey": key, "ReportBucket": bucket}
+
+              if os.environ.get("AUTO_DELETE","false").lower() == "true":
+                  try:
+                      cfn.delete_stack(StackName=os.environ["STACK_NAME"])
+                      out["StackDeleteRequested"] = True
+                  except Exception as e:
+                      out["StackDeleteRequested"] = False
+                      out["DeleteError"] = str(e)
+              return out
+
+  KickoffFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-KickoffFn"
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: !Ref RCKickoff
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      DeadLetterConfig: { TargetArn: !GetAtt LambdaDLQ.Arn }
+      Role: !GetAtt KickoffRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+        SubnetIds: !Ref SubnetIds
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          sfn = boto3.client('stepfunctions')
+
+          def send_response(event, status, reason):
+              body = {
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": "KickoffOnce",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {}
+              }
+              data = json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=data,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(data))}
+              )
+              with urllib.request.urlopen(req): pass
+
+          def handler(event, ctx):
+              try:
+                  if event.get("RequestType") == "Create":
+                      sfn.start_execution(
+                          stateMachineArn=event["ResourceProperties"]["StateArn"],
+                          input="{}"
+                      )
+                      send_response(event, "SUCCESS", "Started on Create")
+                  else:
+                      send_response(event, "SUCCESS", "No action for Update/Delete")
+              except Exception as e:
+                  try:
+                      send_response(event, "FAILED", f"Error: {e}")
+                  finally:
+                      raise
+
+  ########################################################
+  # Step Functions (long waits ok) + retries + logging (encrypted)
+  ########################################################
+  SFLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${AWS::StackName}-UpgradeStateMachine"
+      RetentionInDays: 14
+      KmsKeyId: !If
+        - UseProvidedLogsKms
+        - !Ref LogsKmsKeyArn
+        - !GetAtt LogsKmsKey.Arn
+
+  UpgradeStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt SFNRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt SFLogs.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "Rebuild each targeted WorkSpace after NEXT snapshot, then CSV → (optional) cleanup.",
+            "StartAt": "UpdateBundle",
+            "States": {
+              "UpdateBundle": {
+                "Type": "Task",
+                "Resource": "${UpdateBundleFn.Arn}",
+                "Parameters": { "BundleId": "${BundleId}", "ImageId": "${ImageId}" },
+                "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                "Next": "ListTargets"
+              },
+              "ListTargets": {
+                "Type": "Task",
+                "Resource": "${ListTargetsFn.Arn}",
+                "Parameters": { "TagKey": "${TargetTagKey}", "TagValue": "${TargetTagValue}" },
+                "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                "ResultPath": "$.TargetsOut",
+                "Next": "CountTargets"
+              },
+              "CountTargets": {
+                "Type": "Pass",
+                "Parameters": {
+                  "Targets.$": "$.TargetsOut.Targets",
+                  "Count.$": "States.ArrayLength($.TargetsOut.Targets)"
+                },
+                "ResultPath": "$.TargetsMeta",
+                "Next": "Any?"
+              },
+              "Any?": {
+                "Type": "Choice",
+                "Choices": [
+                  { "Variable": "$.TargetsMeta.Count", "NumericGreaterThan": 0, "Next": "ProcessAll" }
+                ],
+                "Default": "ReportAndCleanupEmpty"
+              },
+              "ProcessAll": {
+                "Type": "Map",
+                "ItemsPath": "$.TargetsOut.Targets",
+                "MaxConcurrency": ${MaxConcurrent},
+                "Parameters": {
+                  "WorkspaceId.$": "$$.Map.Item.Value.WorkspaceId",
+                  "ComputerName.$": "$$.Map.Item.Value.ComputerName",
+                  "PollSeconds": ${PollSeconds},
+                  "WaitTimeoutMinutes": ${WaitTimeoutMinutes},
+                  "NotifySeconds": ${NotifySeconds}
+                },
+                "Iterator": {
+                  "StartAt": "ComputeDeadline",
+                  "States": {
+                    "ComputeDeadline": {
+                      "Type": "Task",
+                      "Resource": "${ProcessWorkspaceFn.Arn}",
+                      "Parameters": { 
+                        "Action": "ComputeDeadline", 
+                        "WorkspaceId.$": "$.WorkspaceId",
+                        "WaitTimeoutMinutes.$": "$.WaitTimeoutMinutes"
+                      },
+                      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                      "ResultPath": "$.Deadline",
+                      "Next": "GetBaseline"
+                    },
+                    "GetBaseline": {
+                      "Type": "Task",
+                      "Resource": "${ProcessWorkspaceFn.Arn}",
+                      "Parameters": { "Action": "GetBaseline", "WorkspaceId.$": "$.WorkspaceId" },
+                      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                      "ResultPath": "$.Baseline",
+                      "Next": "CheckFresh"
+                    },
+                    "CheckFresh": {
+                      "Type": "Task",
+                      "Resource": "${ProcessWorkspaceFn.Arn}",
+                      "Parameters": {
+                        "Action": "WaitNext",
+                        "WorkspaceId.$": "$.WorkspaceId",
+                        "BaselineIso.$": "$.Baseline.BaselineIso",
+                        "BaselineTs.$": "$.Baseline.BaselineTs",
+                        "DeadlineEpoch.$": "$.Deadline.DeadlineEpoch"
+                      },
+                      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                      "ResultPath": "$.WaitRes",
+                      "Next": "Fresh?"
+                    },
+                    "Fresh?": {
+                      "Type": "Choice",
+                      "Choices": [
+                        { "Variable": "$.WaitRes.timedOut", "BooleanEquals": true, "Next": "SetNotifyDefault" },
+                        { "Variable": "$.WaitRes.fresh", "BooleanEquals": true, "Next": "Notify" }
+                      ],
+                      "Default": "WaitAndRecheck"
+                    },
+                    "WaitAndRecheck": {
+                      "Type": "Wait",
+                      "SecondsPath": "$.PollSeconds",
+                      "Next": "CheckFresh"
+                    },
+                    "SetNotifyDefault": {
+                      "Type": "Pass",
+                      "Parameters": { "sent": false },
+                      "ResultPath": "$.NotifyOut",
+                      "Next": "SetRebuildDefault"
+                    },
+                    "SetRebuildDefault": {
+                      "Type": "Pass",
+                      "Parameters": { "RebuildRequested": false, "RebuildRequestedAt": "" },
+                      "ResultPath": "$.RebuildOut",
+                      "Next": "ComposeResult"
+                    },
+                    "Notify": {
+                      "Type": "Task",
+                      "Resource": "${ProcessWorkspaceFn.Arn}",
+                      "Parameters": { 
+                        "Action": "Notify", 
+                        "WorkspaceId.$": "$.WorkspaceId", 
+                        "NotifySeconds.$": "$.NotifySeconds",
+                        "ComputerName.$": "$.ComputerName"
+                      },
+                      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                      "ResultPath": "$.NotifyOut",
+                      "Next": "Rebuild"
+                    },
+                    "Rebuild": {
+                      "Type": "Task",
+                      "Resource": "${ProcessWorkspaceFn.Arn}",
+                      "Parameters": { "Action": "Rebuild", "WorkspaceId.$": "$.WorkspaceId" },
+                      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                      "ResultPath": "$.RebuildOut",
+                      "Next": "ComposeResult"
+                    },
+                    "ComposeResult": {
+                      "Type": "Pass",
+                      "Parameters": {
+                        "WorkspaceId.$": "$.WorkspaceId",
+                        "ComputerName.$": "$.ComputerName",
+                        "BaselineSnapshotIso.$": "$.Baseline.BaselineIso",
+                        "FreshSnapshotIso.$": "$.WaitRes.latestIso",
+                        "TimedOutWaiting.$": "$.WaitRes.timedOut",
+                        "NotifySeconds.$": "$.NotifySeconds",
+                        "UserNotified.$": "$.NotifyOut.sent",
+                        "RebuildRequested.$": "$.RebuildOut.RebuildRequested",
+                        "RebuildRequestedAt.$": "$.RebuildOut.RebuildRequestedAt"
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                "ResultPath": "$.Results",
+                "Next": "ReportAndCleanup"
+              },
+              "ReportAndCleanup": {
+                "Type": "Task",
+                "Resource": "${ReportAndCleanupFn.Arn}",
+                "Parameters": {
+                  "Results.$": "$.Results",
+                  "ReportBucketName": "${ReportBucketName}",
+                  "ReportPrefix": "${ReportPrefix}",
+                  "ReportSSEKmsKeyArn": "${ReportSSEKmsKeyArn}"
+                },
+                "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                "End": true
+              },
+              "ReportAndCleanupEmpty": {
+                "Type": "Task",
+                "Resource": "${ReportAndCleanupFn.Arn}",
+                "Parameters": {
+                  "Results": [],
+                  "ReportBucketName": "${ReportBucketName}",
+                  "ReportPrefix": "${ReportPrefix}",
+                  "ReportSSEKmsKeyArn": "${ReportSSEKmsKeyArn}"
+                },
+                "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }],
+                "End": true
+              }
+            }
+          }
+
+  ########################################################
+  # Kickoff custom resource: start once on Create
+  ########################################################
+  KickoffOnce:
+    Type: Custom::Kickoff
+    Properties:
+      ServiceToken: !GetAtt KickoffFn.Arn
+      StateArn: !Ref UpgradeStateMachine
+
+Outputs:
+  StateMachineArn:
+    Description: Auto-started once; re-run by updating stack (or set AutoSelfDeleteStack=false)
+    Value: !Ref UpgradeStateMachine
+  ReportBucketUsed:
+    Value: !Ref ReportBucketName
+  ReportPrefixUsed:
+    Value: !Ref ReportPrefix
+  ReportSSEKmsKeyArnUsed:
+    Value: !Ref ReportSSEKmsKeyArn
