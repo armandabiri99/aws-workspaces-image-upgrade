@@ -107,9 +107,52 @@ If `AutoSelfDeleteStack=true`, the stack self-deletes after report upload.
 
 ## 🧰 Example Use Case
 
-> You’ve created a new Windows 11 image and need to roll it out to 200 WorkSpaces.  
-> Tag your production WorkSpaces (`Env=Prod`), update the custom bundle, and deploy this stack.  
-> It waits for snapshots, notifies users, rebuilds, and gives you a CSV audit in S3.
+Imagine you’re managing **200 Amazon WorkSpaces** across multiple departments (e.g., Accounting, HR, and Engineering).  
+You’ve built a **new Windows 11 custom image** that includes:
+- Updated corporate software (Office, Chrome, antivirus)
+- New domain policies and baseline configurations
+- Optimized system settings for performance and security
+
+Now, you need to roll this image out to all production WorkSpaces, but you can’t afford downtime, missed backups, or manual intervention.
+
+With this automation:
+
+1. You **update your custom WorkSpaces Bundle** with the new `ImageId`.
+2. Tag all production WorkSpaces with `Env=Prod` (or use any tag-based filter).
+3. Deploy this CloudFormation stack with your parameters:
+   - `BundleId` → your target custom bundle  
+   - `ImageId` → your new image version  
+   - `ReportBucketName` → your audit/report S3 bucket  
+   - `SubnetIds` → private subnets with egress to AWS APIs  
+   - `AutoSelfDeleteStack` → `true` (for one-time upgrade)
+
+Once deployed:
+- The stack **updates the bundle**, discovers all tagged WorkSpaces, and begins watching each for its **next rebuild snapshot** (often created automatically overnight).  
+- As soon as a fresh snapshot is available, the automation optionally **notifies the user** through an SSM message (“Your WorkSpace will be rebuilt soon—please save your work”), then **initiates the rebuild**.
+- When every WorkSpace has been rebuilt, it **writes a CSV report** to your S3 bucket summarizing:
+  - Which WorkSpaces rebuilt successfully  
+  - Which timed out waiting for a snapshot  
+  - Whether notifications were delivered  
+
+Finally, if you enabled auto-deletion, the stack **removes itself**, leaving only the encrypted CloudWatch logs and the S3 report behind for compliance and auditing.
+
+---
+
+### 🔎 Real-World Impact
+
+This automation replaces what would normally require:
+- **Manual rebuilds** for each WorkSpace  
+- **Tracking snapshot completion times** by hand  
+- **Manual communication** with each user  
+- **Multiple AWS console sessions or CLI loops**
+
+With a single CloudFormation deployment, you now get:
+- Consistent, auditable, and **fully automated rebuilds**  
+- **No human error** or skipped instances  
+- **Nightly snapshot safety** before upgrade  
+- A ready-to-share **CSV report** for your management or compliance team  
+
+This process can be reused for future image upgrades by simply redeploying the same stack with a new `ImageId`.
 
 ---
 
