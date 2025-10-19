@@ -937,7 +937,7 @@ Resources:
           }
 
   ########################################################
-  # Kickoff custom resource: start once on Create
+  # Kickoff custom resource
   ########################################################
   KickoffOnce:
     Type: Custom::Kickoff
