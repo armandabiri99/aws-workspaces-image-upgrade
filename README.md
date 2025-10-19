@@ -4,6 +4,8 @@ This project automates **mass image upgrades** for tagged Amazon WorkSpaces flee
 It’s a **CloudFormation-driven, one-shot pipeline** that updates a target bundle to a new image, waits for the next automatic snapshot per WorkSpace, optionally notifies users via SSM, performs a controlled rebuild, generates a CSV report in S3, and can self-delete after completion.
 
 ---
+# 🏛️ System Architecture Diagram
+
 <img width="6152" height="2542" alt="infrastructure-composer-2025-10-19T070517 430Zhnu-workspaces_bundle_upgrade yaml" src="https://github.com/user-attachments/assets/2020bd3d-4837-466e-8c8d-983850abc598" />
 
 ---
