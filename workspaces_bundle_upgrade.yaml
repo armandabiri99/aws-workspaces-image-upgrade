@@ -109,7 +109,6 @@ Conditions:
   CreateSqsKmsKey: !Equals [ !Ref SqsKmsKeyArn, "" ]
   UseProvidedLogsKms: !Not [ !Equals [ !Ref LogsKmsKeyArn, "" ] ]
   CreateLogsKmsKey: !Equals [ !Ref LogsKmsKeyArn, "" ]
-  UseReportSSEKms: !Not [ !Equals [ !Ref ReportSSEKmsKeyArn, "" ] ]
 
 Resources:
   ########################################################
@@ -144,8 +143,6 @@ Resources:
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
-              ArnLike:
-                aws:SourceArn: !GetAtt LambdaDLQ.Arn
 
   SqsKmsAlias:
     Type: AWS::KMS::Alias
@@ -937,7 +934,7 @@ Resources:
           }
 
   ########################################################
-  # Kickoff custom resource
+  # Kickoff custom resource: start once on Create
   ########################################################
   KickoffOnce:
     Type: Custom::Kickoff
